@@ -37,6 +37,27 @@ Important:
 - Any API used in the retrieval pipeline must also be backed by an open-weight model within the same limit.
 - Closed-source APIs such as GPT, Claude, etc. are **not allowed**.
 
+## Current Slurm Resources
+
+Current account and QOS settings for user `mace6728`:
+
+- Slurm account: `acd115049`
+- QOS: `contest_v100`
+- Partition: `nycugpu_queue`
+- Maximum wall time: `00:30:00`
+- Maximum GPUs per user: `gres/gpu=2`
+- Maximum simultaneously running jobs per user: `1`
+- Maximum nodes per job: `1`
+- Maximum CPUs per job: `64`
+
+Practical implications:
+
+- Submit at most one running job at a time.
+- Keep each job within 30 minutes.
+- Use no more than 2 GPUs total.
+- Do not submit multi-node jobs.
+- The provided `run_hw3.slurm` script defaults to 1 GPU and 4 CPUs to stay safely under the current QOS limits.
+
 ## Dataset In This Folder
 
 Expected files:
@@ -162,3 +183,33 @@ The report must cover these 4 parts:
 - Ensure ranking is **within each sample's candidate pool**.
 - Validate submission formatting before uploading.
 - Keep experiment logs because the report requires result-based analysis, not just method descriptions.
+
+## Slurm Submission
+
+Submit the default Kaggle-generation job:
+
+```bash
+sbatch run_hw3.slurm
+```
+
+Useful overrides:
+
+```bash
+MODE=eval METHOD=hybrid sbatch run_hw3.slurm
+MODE=submit METHOD=hybrid OUTPUT=outputs/submission.csv sbatch run_hw3.slurm
+MODE=eval METHOD=bm25 EXTRA_ARGS="--dev-ratio 0.1" sbatch run_hw3.slurm
+```
+
+The script writes Slurm logs to `outputs/slurm/` and defaults to:
+
+```bash
+python3 HW3_112550043.py --mode submit --method hybrid --output outputs/submission.csv
+```
+
+`HW3_112550043.py` requires Python 3.7 or newer. If the cluster default
+`python3` is older, `run_hw3.slurm` loads `miniconda3/conda24.5.0_py3.9`
+by default. You can still submit with an explicit interpreter:
+
+```bash
+PYTHON_BIN=/path/to/python MODE=submit METHOD=hybrid sbatch run_hw3.slurm
+```
