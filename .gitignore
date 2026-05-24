@@ -5,11 +5,9 @@ __pycache__/
 outputs/
 *.log
 *.Zone.Identifier
+.env
 
 # Local data assets are not needed in the code repository.
-train.jsonl
-test.jsonl
 sample_submission.csv
 images/
 INLP-HW3.pptx.pdf
-AGENTS.md
