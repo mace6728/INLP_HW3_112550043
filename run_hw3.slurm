@@ -31,7 +31,11 @@ CACHE_DIR="${CACHE_DIR:-.cache/hw3}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 DEVICE="${DEVICE:-auto}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+if [[ -z "${PYTHON_BIN:-}" && -x ".venv/bin/python" ]]; then
+  PYTHON_BIN=".venv/bin/python"
+else
+  PYTHON_BIN="${PYTHON_BIN:-python3}"
+fi
 
 echo "Job started at $(date)"
 echo "Host: $(hostname)"
