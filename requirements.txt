@@ -1,0 +1,11 @@
+# Core numerical utilities
+numpy>=1.24
+
+# Model backends for dense retrieval, reranking, LLM baseline, and CLIP baseline
+torch>=2.1
+torchvision>=0.16
+transformers>=4.40
+sentence-transformers>=2.6
+
+# Image loading for raw image retrieval
+Pillow>=10.0
