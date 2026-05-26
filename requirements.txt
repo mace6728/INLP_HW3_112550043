@@ -7,6 +7,7 @@ torch>=2.1
 torchvision>=0.16
 transformers>=4.40
 sentence-transformers>=2.6
+peft>=0.17
 
 # Image loading for raw image retrieval
 Pillow>=10.0

@@ -231,16 +231,16 @@ def resolve_img_path(img_path: str, data_root: Path) -> str:
 
 def candidate_to_text(candidate: EvidenceCandidate) -> str:
     prefix_map = {
-        "text": "[TEXT]",
-        "table": "[TABLE]",
-        "figure": "[FIGURE]",
-        "chart": "[CHART]",
-        "image": "[IMAGE]",
-        "layout": "[LAYOUT]",
+        "text": "Text passage",
+        "table": "Table data",
+        "figure": "Figure description",
+        "chart": "Chart description",
+        "image": "Image description",
+        "layout": "Layout element",
     }
-    prefix = prefix_map.get(candidate.raw_type.lower(), f"[{candidate.raw_type.upper()}]")
+    prefix = prefix_map.get(candidate.raw_type.lower(), f"{candidate.raw_type.capitalize()} evidence")
     content = normalize_text(candidate.content)
-    return f"{prefix} {content}".strip()
+    return f"This is a {prefix} containing the following information: {content}".strip()
 
 
 def expected_modality_key(sample: Sample) -> Tuple[str, ...]:
@@ -846,12 +846,13 @@ class HFReranker:
 
         self.device = resolve_device(device)
         self.max_length = max_length
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         self.model = AutoModelForSequenceClassification.from_pretrained(
             model_name,
             torch_dtype=torch_dtype_for_device(self.device),
+            trust_remote_code=True,
+            device_map="auto",
         )
-        self.model.to(self.device)
         self.model.eval()
 
     def score_pairs(self, query: str, documents: Sequence[str], batch_size: int = 8) -> np.ndarray:
@@ -1070,6 +1071,23 @@ def rerank_order(
     top_index_set = set(top_indices)
     remainder = [idx for idx in base_order if idx not in top_index_set]
     return reranked_top_indices + remainder
+
+
+def reranker_only_retrieve_batch(
+    samples: Sequence[Sample],
+    device: str,
+    batch_size: int,
+    top_k: int,
+    reranker_model_name: str,
+) -> Dict[str, List[str]]:
+    reranker = HFReranker(reranker_model_name, device=device)
+    predictions: Dict[str, List[str]] = {}
+    for sample in samples:
+        documents = [candidate_to_text(candidate) for candidate in sample.candidates]
+        rerank_scores = reranker.score_pairs(sample.question, documents, batch_size=max(1, min(batch_size, 8)))
+        ranked_indices = stable_rank_indices(rerank_scores)
+        predictions[sample.q_id] = [sample.candidates[idx].quote_id for idx in ranked_indices[:top_k]]
+    return predictions
 
 
 def hybrid_retrieve_batch(
@@ -2195,7 +2213,7 @@ def doc_aware_ranker_retrieve_batch(
                 reranker=reranker,
                 rerank_topk=rerank_topk,
                 reranker_weight=reranker_weight,
-                batch_size=max(1, min(batch_size, 8)),
+                batch_size=max(1, min(batch_size, 4)),
             )
         else:
             ranked_indices = stable_rank_indices(fused_scores)
@@ -2701,6 +2719,14 @@ def retrieve_predictions(
             reranker_weight=args.reranker_weight,
             cache_dir=cache_dir,
         )
+    if method == "reranker_only":
+        return reranker_only_retrieve_batch(
+            samples,
+            device=args.device,
+            batch_size=args.batch_size,
+            top_k=args.top_k,
+            reranker_model_name=args.reranker_model,
+        )
     if method == "dual_reranker":
         if memory_train_samples is None:
             raise ValueError("dual_reranker method requires memory_train_samples")
@@ -2860,7 +2886,7 @@ def run_ablation_suite(train_samples: Sequence[Sample], args: argparse.Namespace
         mixed_overlap_ratio=args.mixed_overlap_ratio,
         holdout_domain=args.holdout_domain,
     )
-    methods = ["bm25", "dense", "hybrid", "typed_hybrid", "memory", "memory_hybrid", "typed_memory_hybrid", "dual_reranker", "doc_aware_ranker", "routed_doc_aware", "llm", "image"]
+    methods = ["bm25", "dense", "hybrid", "typed_hybrid", "memory", "memory_hybrid", "typed_memory_hybrid", "reranker_only", "dual_reranker", "doc_aware_ranker", "routed_doc_aware", "llm", "image"]
     results: Dict[str, Any] = {}
     for method in methods:
         try:
@@ -3114,7 +3140,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--mode", choices=["stats", "eval", "dump_eval", "ablate", "analyze", "sweep", "submit"], required=True)
     parser.add_argument(
         "--method",
-        choices=["bm25", "dense", "hybrid", "typed_hybrid", "memory", "memory_hybrid", "typed_memory_hybrid", "dual_reranker", "doc_aware_ranker", "routed_doc_aware", "llm", "image"],
+        choices=["bm25", "dense", "hybrid", "typed_hybrid", "memory", "memory_hybrid", "typed_memory_hybrid", "reranker_only", "dual_reranker", "doc_aware_ranker", "routed_doc_aware", "llm", "image"],
         default="hybrid",
     )
     parser.add_argument("--train-path", default="train.jsonl")
@@ -3149,9 +3175,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--sweep-type-weights", default="0.0,0.05,0.1,0.15,0.25")
     parser.add_argument("--sweep-top-n", type=int, default=20)
 
-    parser.add_argument("--use-reranker", action="store_true")
-    parser.add_argument("--reranker-model", default="BAAI/bge-reranker-large")
-    parser.add_argument("--second-reranker-model", default="BAAI/bge-reranker-large")
+    parser.add_argument("--use-reranker", action="store_true", default=True)
+    parser.add_argument("--reranker-model", default="Qwen/Qwen3-Reranker-8B")
+    parser.add_argument("--second-reranker-model", default="Qwen/Qwen3-Reranker-8B")
     parser.add_argument("--rerank-topk", type=int, default=10)
     parser.add_argument("--reranker-weight", type=float, default=0.50)
     parser.add_argument("--dual-primary-weight", type=float, default=1.15)
