@@ -757,6 +757,64 @@ def torch_dtype_for_device(device: str):
     return torch.float32
 
 
+QWEN_RERANK_DEFAULT_INSTRUCTION = (
+    "Given a document question, retrieve evidence snippets or image descriptions that support the answer."
+)
+QWEN_RERANK_SYSTEM_PREFIX = (
+    '<|im_start|>system\n'
+    'Judge whether the Document meets the requirements based on the Query and the Instruct provided. '
+    'Note that the answer can only be "yes" or "no".'
+    '<|im_end|>\n<|im_start|>user\n'
+)
+QWEN_RERANK_ASSISTANT_SUFFIX = '<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n'
+QWEN_RERANK_METADATA_FILENAME = "hw3_qwen_reranker_config.json"
+
+
+def load_qwen_reranker_instruction(
+    model_name: str,
+    default_instruction: str = QWEN_RERANK_DEFAULT_INSTRUCTION,
+) -> str:
+    metadata_path = Path(model_name) / QWEN_RERANK_METADATA_FILENAME
+    if not metadata_path.exists():
+        return default_instruction
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception:
+        return default_instruction
+    instruction = safe_strip(payload.get("instruction"))
+    return instruction or default_instruction
+
+
+def is_qwen_causal_reranker_model(model_name: str) -> bool:
+    model_path = Path(model_name)
+    if model_path.exists():
+        if (model_path / "adapter_config.json").exists():
+            return True
+        if (model_path / QWEN_RERANK_METADATA_FILENAME).exists():
+            return True
+
+    lowered = model_name.lower()
+    if "qwen" not in lowered or "reranker" not in lowered:
+        return False
+
+    try:
+        from transformers import AutoConfig  # type: ignore
+
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        architectures = list(getattr(config, "architectures", []) or [])
+        return any("ForCausalLM" in architecture for architecture in architectures)
+    except Exception:
+        return False
+
+
+def format_qwen_reranker_content(instruction: str, query: str, document: str) -> str:
+    return "<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {document}".format(
+        instruction=instruction,
+        query=normalize_text(query),
+        document=normalize_text(document),
+    )
+
+
 def save_pickle(path: Path, payload: Any) -> None:
     ensure_dir(path.parent)
     with path.open("wb") as handle:
@@ -834,10 +892,124 @@ class HFTextEmbedder:
         return np.vstack(embeddings)
 
 
-class HFReranker:
+class QwenCausalReranker:
     def __init__(self, model_name: str, device: str = "auto", max_length: int = 512):
         try:
-            import torch  # type: ignore
+            from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "Qwen reranking requires `transformers` + `torch` in the active environment."
+            ) from exc
+
+        self.device = resolve_device(device)
+        self.max_length = max_length
+        self.instruction = load_qwen_reranker_instruction(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            padding_side="left",
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        model_kwargs = {
+            "torch_dtype": torch_dtype_for_device(self.device),
+            "trust_remote_code": True,
+            "device_map": "auto",
+        }
+        model_path = Path(model_name)
+        if model_path.exists() and (model_path / "adapter_config.json").exists():
+            try:
+                from peft import PeftConfig, PeftModel  # type: ignore
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Loading a Qwen LoRA adapter requires `peft` in the active environment."
+                ) from exc
+
+            adapter_config = PeftConfig.from_pretrained(model_name)
+            base_model = AutoModelForCausalLM.from_pretrained(
+                adapter_config.base_model_name_or_path,
+                **model_kwargs,
+            )
+            self.model = PeftModel.from_pretrained(base_model, model_name)
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+        self.model.eval()
+
+        self.token_true_id = self.tokenizer.convert_tokens_to_ids("yes")
+        self.token_false_id = self.tokenizer.convert_tokens_to_ids("no")
+        if self.token_true_id is None or self.token_false_id is None:
+            raise RuntimeError("Failed to resolve 'yes'/'no' token ids for Qwen reranker")
+
+        self.prefix_tokens = self.tokenizer.encode(QWEN_RERANK_SYSTEM_PREFIX, add_special_tokens=False)
+        self.suffix_tokens = self.tokenizer.encode(QWEN_RERANK_ASSISTANT_SUFFIX, add_special_tokens=False)
+        if len(self.prefix_tokens) + len(self.suffix_tokens) >= self.max_length:
+            raise ValueError(
+                f"Qwen reranker max_length={self.max_length} is too small for prompt overhead"
+            )
+
+    def _encode_pairs(self, pairs: Sequence[Tuple[str, str]]) -> Dict[str, Any]:
+        available_tokens = self.max_length - len(self.prefix_tokens) - len(self.suffix_tokens)
+        contents = [
+            format_qwen_reranker_content(self.instruction, query, document)
+            for query, document in pairs
+        ]
+        encoded = self.tokenizer(
+            contents,
+            padding=False,
+            truncation=True,
+            max_length=available_tokens,
+            return_attention_mask=False,
+            add_special_tokens=False,
+        )
+        encoded["input_ids"] = [
+            self.prefix_tokens + input_ids + self.suffix_tokens
+            for input_ids in encoded["input_ids"]
+        ]
+        padded = self.tokenizer.pad(
+            encoded,
+            padding=True,
+            return_tensors="pt",
+            max_length=self.max_length,
+        )
+        return {
+            key: value.to(self.device)
+            for key, value in padded.items()
+        }
+
+    def score_pairs(self, query: str, documents: Sequence[str], batch_size: int = 2) -> np.ndarray:
+        import torch  # type: ignore
+
+        capped_batch_size = max(1, min(batch_size, 2))
+        normalized_query = normalize_text(query)
+        normalized_documents = [normalize_text(document) for document in documents]
+        scores: List[np.ndarray] = []
+        for start in range(0, len(normalized_documents), capped_batch_size):
+            pairs = [
+                (normalized_query, document)
+                for document in normalized_documents[start : start + capped_batch_size]
+            ]
+            encoded = self._encode_pairs(pairs)
+            with torch.inference_mode():
+                logits = self.model(**encoded).logits[:, -1, :]
+                true_logits = logits[:, self.token_true_id]
+                false_logits = logits[:, self.token_false_id]
+                yes_scores = torch.nn.functional.log_softmax(
+                    torch.stack([false_logits, true_logits], dim=1),
+                    dim=1,
+                )[:, 1].exp()
+            scores.append(yes_scores.detach().float().cpu().numpy())
+        return np.concatenate(scores).astype(np.float32) if scores else np.zeros(0, dtype=np.float32)
+
+
+class HFReranker:
+    def __init__(self, model_name: str, device: str = "auto", max_length: int = 512):
+        self.backend = None
+        if is_qwen_causal_reranker_model(model_name):
+            self.backend = QwenCausalReranker(model_name, device=device, max_length=max_length)
+            return
+
+        try:
             from transformers import AutoModelForSequenceClassification, AutoTokenizer  # type: ignore
         except ImportError as exc:
             raise RuntimeError(
@@ -856,6 +1028,9 @@ class HFReranker:
         self.model.eval()
 
     def score_pairs(self, query: str, documents: Sequence[str], batch_size: int = 8) -> np.ndarray:
+        if self.backend is not None:
+            return self.backend.score_pairs(query, documents, batch_size=batch_size)
+
         import torch  # type: ignore
 
         scores: List[np.ndarray] = []
